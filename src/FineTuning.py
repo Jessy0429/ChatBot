@@ -6,7 +6,7 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader, RandomSampler
-from transformers import AutoTokenizer, AdamW, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoConfig, AutoModelWithLMHead, AdamW, get_linear_schedule_with_warmup
 from Args import Args
 
 args = Args()
@@ -112,6 +112,9 @@ def train(model, tokenizer, tr_dataloader, te_dataloader):
 
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
+    best = 0.0
+    output_dir = os.path.join(args.output_dir, "eval_best")
+    os.makedirs(output_dir, exist_ok=True)
     model.zero_grad()
 
     for epoch in range(args.num_train_epochs):
@@ -143,10 +146,41 @@ def train(model, tokenizer, tr_dataloader, te_dataloader):
                     logging_loss = 0.0
 
         logger.info("Training loss epoch[%d/%d]: %f", epoch, args.num_train_epochs, tr_loss / global_step)
-        result = evaluate(model, tokenizer, te_dataloader)
+        perplexity = evaluate(model, tokenizer, te_dataloader)
+        if perplexity < best:
+            model.save_pretrained(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            torch.save(args, os.path.join(output_dir, "training_args.bin"))
+            torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+            torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+            logger.info("Saving model and optimizer and scheduler states to %s", output_dir)
 
         tr_loss = 0.0
         global_step = 0
+
+
+def evaluate(model, tokenizer, dataloader):
+    logger.info("***** Running evaluation *****")
+    logger.info("  Batch size = %d", args.eval_batch_size)
+    eval_loss = 0.0
+    eval_steps = 0
+    model.eval()
+
+    for batch in enumerate(dataloader):
+        inputs, labels = (batch, batch)
+        inputs = inputs.to(args.device)
+        labels = labels.to(args.device)
+
+        with torch.no_grad():
+            outputs = model(inputs, labels=labels)
+            lm_loss = outputs[0]
+            eval_loss += lm_loss.mean().item()
+        eval_steps += 1
+
+    logger.info("***** Eval loss {} *****".format(eval_loss))
+    eval_loss = eval_loss / eval_steps
+    perplexity = torch.exp(torch.tensor(eval_loss))
+    return perplexity
 
 
 if __name__ == '__main__':
@@ -162,3 +196,13 @@ if __name__ == '__main__':
 
     train_dataloader, test_dataloader = load_and_cache_data(args.data_path, args.cache_dir, tokenizer, args.block_size)
 
+    config = AutoConfig.from_pretrained(args.config_name, cache_dir=args.cache_dir)
+    model = AutoModelWithLMHead.from_pretrained(
+        args.model_name_or_path,
+        from_tf=False,
+        config=config,
+        cache_dir=args.cache_dir
+    )
+    model.to(args.device)
+
+    train(model, tokenizer, train_dataloader, test_dataloader)
